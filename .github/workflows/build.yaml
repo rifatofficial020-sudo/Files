@@ -1,0 +1,53 @@
+
+name: Build Files for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+
+      - name: Restore NuGet packages
+        run: nuget restore Files.sln
+
+      - name: Build solution
+        run: msbuild Files.sln /m /p:Configuration=Release /p:Platform=x64
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Files-Windows-x64
+          path: |
+            **/bin/Release/**/*.msix
+            **/bin/Release/**/*.msixbundle
+            **/bin/Release/**/*.msixupload
+          if-no-files-found: warn
+          retention-days: 14
