@@ -1,3 +1,4 @@
+
 name: Build Files EXE Installer
 
 on:
@@ -27,6 +28,17 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+
+      - name: Clean previous build files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-ChildItem -Path "src" -Directory -Recurse -Filter "bin" |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+          Get-ChildItem -Path "src" -Directory -Recurse -Filter "obj" |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Build and package installer
         shell: pwsh
@@ -68,6 +80,7 @@ jobs:
             Write-Host "Creating a temporary signing certificate"
 
             $packagePassword = [Guid]::NewGuid().ToString("N") + "Aa1!"
+
             $securePassword = ConvertTo-SecureString `
               $packagePassword -AsPlainText -Force
 
@@ -96,6 +109,7 @@ jobs:
 
           # Build the Files application.
           Write-Host "Building Files.App..."
+
           msbuild "src/Files.App/Files.App.csproj" `
             /restore `
             /m `
@@ -107,16 +121,19 @@ jobs:
             /p:AppxBundle=Always `
             /p:AppxBundlePlatforms=x64 `
             /p:UapAppxPackageBuildMode=Sideload `
+            /p:AppxIntermediateExtension=.intermediate `
             "/p:PackageCertificateKeyFile=$pfx" `
             "/p:PackageCertificatePassword=$packagePassword"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Files application build failed"
+            throw "Files application build failed with exit code $LASTEXITCODE"
           }
 
           # Locate the generated MSIX/AppX bundle.
           $bundle = Get-ChildItem -Path (Join-Path $root "src/Files.App") -Recurse -File |
-            Where-Object { $_.Extension -in @(".msixbundle", ".appxbundle") } |
+            Where-Object {
+              $_.Extension -in @(".msixbundle", ".appxbundle")
+            } |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
 
@@ -127,7 +144,7 @@ jobs:
           Write-Host "Found package: $($bundle.FullName)"
           Copy-Item $bundle.FullName $stage
 
-          # Copy framework dependencies, if the build generated any.
+          # Copy framework dependencies, if generated.
           $dependencies = Get-ChildItem -Path $bundle.Directory.FullName -Recurse -File |
             Where-Object {
               $_.FullName -match '[\\/]Dependencies[\\/]' -and
@@ -136,6 +153,7 @@ jobs:
 
           if ($dependencies) {
             $depDir = Join-Path $stage "Dependencies"
+
             New-Item -ItemType Directory -Force -Path $depDir | Out-Null
 
             foreach ($dep in $dependencies) {
@@ -149,7 +167,9 @@ jobs:
           $root = $PSScriptRoot
 
           $bundle = Get-ChildItem -LiteralPath $root -File |
-            Where-Object { $_.Extension -in @(".msixbundle", ".appxbundle") } |
+            Where-Object {
+              $_.Extension -in @(".msixbundle", ".appxbundle")
+            } |
             Select-Object -First 1
 
           if (-not $bundle) {
@@ -157,6 +177,7 @@ jobs:
           }
 
           $cert = Join-Path $root "Files-Signing.cer"
+
           if (-not (Test-Path -LiteralPath $cert)) {
             throw "Signing certificate not found"
           }
@@ -171,7 +192,9 @@ jobs:
           if (Test-Path -LiteralPath $dependencyFolder) {
             $deps = @(
               Get-ChildItem -Path $dependencyFolder -Recurse -File |
-                Where-Object { $_.Extension -in @(".appx", ".msix") } |
+                Where-Object {
+                  $_.Extension -in @(".appx", ".msix")
+                } |
                 Select-Object -ExpandProperty FullName
             )
           }
@@ -191,11 +214,11 @@ jobs:
           Write-Host "Files installed successfully"
           '@ | Set-Content (Join-Path $stage "Install-Files.ps1") -Encoding UTF8
 
-          # Read the application version from its manifest.
+          # Read application version from manifest.
           [xml]$manifest = Get-Content "src/Files.App/Package.appxmanifest"
           $version = $manifest.Package.Identity.Version
 
-          # Generate the Inno Setup installer definition.
+          # Generate Inno Setup installer definition.
           @"
           [Setup]
           AppId={{D7A43C18-98A4-4F70-A912-765432109876}
@@ -221,17 +244,20 @@ jobs:
           Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\FilesPackage\Install-Files.ps1"""; Flags: waituntilterminated runhidden; StatusMsg: "Installing Files..."
           "@ | Set-Content (Join-Path $root "installer.iss") -Encoding UTF8
 
-          # Install Inno Setup if it is not already available.
+          # Install Inno Setup if unavailable.
           if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) {
             choco install innosetup --yes --no-progress
+
             if ($LASTEXITCODE -ne 0) {
               throw "Inno Setup installation failed"
             }
           }
 
-          # Compile the EXE installer.
+          # Locate Inno Setup compiler.
           Write-Host "Compiling EXE installer..."
+
           $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+
           if (-not $iscc) {
             $isccPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           }
@@ -243,12 +269,15 @@ jobs:
             throw "ISCC.exe was not found after installing Inno Setup"
           }
 
+          # Compile EXE installer.
           & $isccPath (Join-Path $root "installer.iss")
+
           if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup compilation failed"
           }
 
           $exe = Join-Path $artifacts "Files-Setup-x64.exe"
+
           if (-not (Test-Path -LiteralPath $exe)) {
             throw "Installer EXE was not generated"
           }
