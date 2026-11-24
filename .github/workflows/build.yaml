@@ -15,128 +15,142 @@ jobs:
     name: Build Windows x64 Installer
     runs-on: windows-latest
 
+    env:
+      DOTNET_ROOT: C:\Program Files\dotnet
+      BUILD_CONFIGURATION: Release
+
     steps:
+      # 1. Download repository
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Setup .NET SDK
+      # 2. Install build tools
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # 3. Clean previous build files
       - name: Clean previous build files
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          Get-ChildItem -Path src -Directory -Recurse -Force |
+            Where-Object { $_.Name -in @("bin", "obj") } |
+            ForEach-Object {
+              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
 
-          Get-ChildItem -Path "src" -Directory -Recurse -Filter "bin" |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "Artifacts" -Recurse -Force -ErrorAction SilentlyContinue
 
-          Get-ChildItem -Path "src" -Directory -Recurse -Filter "obj" |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-          Write-Host "Previous build files cleaned."
-
-      - name: Build and package installer
+      # 4. Create or import signing certificate
+      - name: Prepare signing certificate
         shell: pwsh
         env:
           FILES_SIGNING_PFX_BASE64: ${{ secrets.FILES_SIGNING_PFX_BASE64 }}
           FILES_SIGNING_PFX_PASSWORD: ${{ secrets.FILES_SIGNING_PFX_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $certDirectory = Join-Path $env:RUNNER_TEMP "FilesCertificate"
+          New-Item -ItemType Directory -Path $certDirectory -Force | Out-Null
 
-          $root = $env:GITHUB_WORKSPACE
-          $artifacts = Join-Path $root "Artifacts"
-          $stage = Join-Path $artifacts "Package"
+          $pfxPath = Join-Path $certDirectory "FilesSigning.pfx"
+          $cerPath = Join-Path $certDirectory "FilesSigning.cer"
 
-          New-Item -ItemType Directory -Force -Path $artifacts | Out-Null
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          if ($env:FILES_SIGNING_PFX_BASE64) {
+            Write-Host "Importing configured signing certificate..."
 
-          # Create or import the package-signing certificate.
-          $pfx = Join-Path $artifacts "Files-Signing.pfx"
-          $cer = Join-Path $stage "Files-Signing.cer"
+            $bytes = [Convert]::FromBase64String($env:FILES_SIGNING_PFX_BASE64)
+            [IO.File]::WriteAllBytes($pfxPath, $bytes)
 
-          if ($env:FILES_SIGNING_PFX_BASE64 -and $env:FILES_SIGNING_PFX_PASSWORD) {
-            Write-Host "Importing signing certificate..."
+            $password = ConvertTo-SecureString `
+              $env:FILES_SIGNING_PFX_PASSWORD `
+              -AsPlainText -Force
 
-            [IO.File]::WriteAllBytes(
-              $pfx,
-              [Convert]::FromBase64String($env:FILES_SIGNING_PFX_BASE64)
-            )
-
-            $securePassword = ConvertTo-SecureString `
-              $env:FILES_SIGNING_PFX_PASSWORD -AsPlainText -Force
-
-            $cert = Import-PfxCertificate `
-              -FilePath $pfx `
+            $certificate = Import-PfxCertificate `
+              -FilePath $pfxPath `
               -CertStoreLocation Cert:\CurrentUser\My `
-              -Password $securePassword |
-              Select-Object -First 1
+              -Password $password
 
-            $packagePassword = $env:FILES_SIGNING_PFX_PASSWORD
-          }
-          else {
+            if (-not $certificate) {
+              throw "Could not import signing certificate"
+            }
+
+            Export-Certificate `
+              -Cert $certificate `
+              -FilePath $cerPath | Out-Null
+
+          } else {
             Write-Host "Creating a temporary signing certificate..."
 
-            $packagePassword = [Guid]::NewGuid().ToString("N") + "Aa1!"
-
-            $securePassword = ConvertTo-SecureString `
-              $packagePassword -AsPlainText -Force
-
-            $cert = New-SelfSignedCertificate `
-              -Type Custom `
+            $certificate = New-SelfSignedCertificate `
               -Subject "CN=Files" `
+              -Type CodeSigningCert `
               -CertStoreLocation Cert:\CurrentUser\My `
-              -KeyExportPolicy Exportable `
-              -KeySpec Signature `
+              -KeyAlgorithm RSA `
               -KeyLength 2048 `
               -HashAlgorithm SHA256 `
-              -NotAfter (Get-Date).AddYears(2) `
-              -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+              -KeyExportPolicy Exportable `
+              -NotAfter (Get-Date).AddYears(2)
+
+            $password = ConvertTo-SecureString `
+              "Temporary-Files-Certificate-2026!" `
+              -AsPlainText -Force
 
             Export-PfxCertificate `
-              -Cert $cert `
-              -FilePath $pfx `
-              -Password $securePassword | Out-Null
+              -Cert $certificate `
+              -FilePath $pfxPath `
+              -Password $password | Out-Null
+
+            Export-Certificate `
+              -Cert $certificate `
+              -FilePath $cerPath | Out-Null
           }
 
-          if (-not $cert -or $cert.Subject -notmatch "CN=Files") {
-            throw "Signing certificate must have subject CN=Files"
-          }
+          "PFX_PATH=$pfxPath" | Out-File $env:GITHUB_ENV -Append
+          "CER_PATH=$cerPath" | Out-File $env:GITHUB_ENV -Append
 
-          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+      # 5. Restore server project for Windows x64
+      - name: Restore Files.App.Server
+        shell: pwsh
+        run: |
+          Write-Host "Restoring Files.App.Server for Windows x64..."
 
-          # Explicitly restore Files.App.Server.
-          # This fixes NETSDK1004 when its assets file is missing.
-          Write-Host "Restoring Files.App.Server..."
-
-          dotnet restore "src/Files.App.Server/Files.App.Server.csproj"
+          dotnet restore src/Files.App.Server/Files.App.Server.csproj `
+            -p:Platform=x64 `
+            -p:RuntimeIdentifier=win-x64
 
           if ($LASTEXITCODE -ne 0) {
             throw "Files.App.Server NuGet restore failed"
           }
 
-          # Restore the main application.
-          Write-Host "Restoring Files.App..."
+      # 6. Restore main app for Windows x64
+      - name: Restore Files.App
+        shell: pwsh
+        run: |
+          Write-Host "Restoring Files.App for Windows x64..."
 
-          dotnet restore "src/Files.App/Files.App.csproj"
+          dotnet restore src/Files.App/Files.App.csproj `
+            -p:Platform=x64 `
+            -p:RuntimeIdentifier=win-x64
 
           if ($LASTEXITCODE -ne 0) {
             throw "Files.App NuGet restore failed"
           }
 
-          # Build the Files application.
-          Write-Host "Building Files.App..."
+      # 7. Build MSIX bundle
+      - name: Build Files MSIX bundle
+        shell: pwsh
+        run: |
+          Write-Host "Building Files for Windows x64..."
 
-          msbuild "src/Files.App/Files.App.csproj" `
+          msbuild src/Files.App/Files.App.csproj `
             /m `
+            /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
+            /p:RuntimeIdentifier=win-x64 `
             /p:AppxPackage=true `
             /p:GenerateAppxPackageOnBuild=true `
             /p:AppxPackageSigningEnabled=true `
@@ -144,20 +158,25 @@ jobs:
             /p:AppxBundlePlatforms=x64 `
             /p:UapAppxPackageBuildMode=Sideload `
             /p:AppxIntermediateExtension=.intermediate `
-            "/p:PackageCertificateKeyFile=$pfx" `
-            "/p:PackageCertificatePassword=$packagePassword"
+            /p:PackageCertificateKeyFile="$env:PFX_PATH" `
+            /p:PackageCertificatePassword="Temporary-Files-Certificate-2026!"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Files application build failed with exit code $LASTEXITCODE"
+            throw "Files MSIX build failed"
           }
 
-          # Locate the generated MSIX/AppX bundle.
-          Write-Host "Searching for MSIX bundle..."
+      # 8. Stage bundle and dependencies
+      - name: Prepare installer files
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:GITHUB_WORKSPACE "Artifacts"
+          $packageDirectory = Join-Path $output "Package"
 
-          $bundle = Get-ChildItem `
-            -Path (Join-Path $root "src/Files.App") `
-            -Recurse `
-            -File |
+          New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
+
+          Write-Host "Searching for generated MSIX bundle..."
+
+          $bundle = Get-ChildItem -Path src -Recurse -File |
             Where-Object {
               $_.Extension -in @(".msixbundle", ".appxbundle")
             } |
@@ -165,174 +184,171 @@ jobs:
             Select-Object -First 1
 
           if (-not $bundle) {
-            throw "MSIX bundle was not generated"
+            throw "No MSIX or APPX bundle was generated"
           }
 
-          Write-Host "Found package: $($bundle.FullName)"
+          Write-Host "Found bundle: $($bundle.FullName)"
 
-          Copy-Item $bundle.FullName $stage -Force
+          Copy-Item $bundle.FullName $packageDirectory
 
-          # Copy framework dependencies, if generated.
-          Write-Host "Collecting package dependencies..."
+          Write-Host "Searching for x64 dependencies..."
 
-          $dependencies = Get-ChildItem `
-            -Path $bundle.Directory.FullName `
-            -Recurse `
-            -File |
-            Where-Object {
-              $_.FullName -match '[\\/]Dependencies[\\/]' -and
-              $_.Extension -in @(".appx", ".msix")
-            }
+          $dependencyDirectories = Get-ChildItem -Path src -Directory -Recurse |
+            Where-Object { $_.Name -eq "Dependencies" }
 
-          if ($dependencies) {
-            $depDir = Join-Path $stage "Dependencies"
+          foreach ($directory in $dependencyDirectories) {
+            $x64Directory = Join-Path $directory.FullName "x64"
 
-            New-Item -ItemType Directory -Force -Path $depDir | Out-Null
-
-            foreach ($dep in $dependencies) {
-              Copy-Item $dep.FullName $depDir -Force
+            if (Test-Path $x64Directory) {
+              Copy-Item `
+                (Join-Path $x64Directory "*") `
+                $packageDirectory `
+                -Recurse -Force
             }
           }
 
-          # Create the package installation script.
+          Copy-Item $env:CER_PATH $packageDirectory
+
+          Write-Host "Writing installation script..."
+
           @'
           $ErrorActionPreference = "Stop"
-          $root = $PSScriptRoot
 
-          $bundle = Get-ChildItem -LiteralPath $root -File |
+          $packageDirectory = Join-Path $PSScriptRoot "Package"
+
+          $bundle = Get-ChildItem -Path $packageDirectory -File |
             Where-Object {
               $_.Extension -in @(".msixbundle", ".appxbundle")
             } |
             Select-Object -First 1
 
           if (-not $bundle) {
-            throw "Application package not found"
+            throw "Application package was not found."
           }
 
-          $cert = Join-Path $root "Files-Signing.cer"
+          $certificate = Get-ChildItem -Path $packageDirectory -Filter "*.cer" |
+            Select-Object -First 1
 
-          if (-not (Test-Path -LiteralPath $cert)) {
-            throw "Signing certificate not found"
+          if ($certificate) {
+            Write-Host "Installing application certificate..."
+
+            Import-Certificate `
+              -FilePath $certificate.FullName `
+              -CertStoreLocation Cert:\CurrentUser\TrustedPeople | Out-Null
+
+            Import-Certificate `
+              -FilePath $certificate.FullName `
+              -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
           }
 
-          Import-Certificate `
-            -FilePath $cert `
-            -CertStoreLocation "Cert:\CurrentUser\TrustedPeople" | Out-Null
+          $dependencies = @(
+            Get-ChildItem -Path $packageDirectory -Filter "*.appx" -File |
+              Select-Object -ExpandProperty FullName
 
-          $dependencyFolder = Join-Path $root "Dependencies"
-          $deps = @()
+            Get-ChildItem -Path $packageDirectory -Filter "*.msix" -File |
+              Select-Object -ExpandProperty FullName
+          )
 
-          if (Test-Path -LiteralPath $dependencyFolder) {
-            $deps = @(
-              Get-ChildItem -Path $dependencyFolder -Recurse -File |
-                Where-Object {
-                  $_.Extension -in @(".appx", ".msix")
-                } |
-                Select-Object -ExpandProperty FullName
-            )
-          }
+          Write-Host "Installing Files..."
 
-          if ($deps.Count -gt 0) {
+          if ($dependencies.Count -gt 0) {
             Add-AppxPackage `
               -Path $bundle.FullName `
-              -DependencyPath $deps `
+              -DependencyPath $dependencies `
               -ForceApplicationShutdown
-          }
-          else {
+          } else {
             Add-AppxPackage `
               -Path $bundle.FullName `
               -ForceApplicationShutdown
           }
 
-          Write-Host "Files installed successfully"
-          '@ | Set-Content (Join-Path $stage "Install-Files.ps1") -Encoding UTF8
+          Write-Host "Files installed successfully."
+          '@ | Set-Content `
+            -Path (Join-Path $output "Install-Files.ps1") `
+            -Encoding UTF8
 
-          # Read application version from manifest.
-          Write-Host "Reading application version..."
+          Write-Host "Installer files staged successfully."
 
-          [xml]$manifest = Get-Content "src/Files.App/Package.appxmanifest"
-          $version = $manifest.Package.Identity.Version
+      # 9. Install Inno Setup
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
 
-          if (-not $version) {
-            throw "Could not read application version from manifest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup installation failed"
           }
 
-          Write-Host "Application version: $version"
+      # 10. Create Inno Setup installer configuration
+      - name: Create installer configuration
+        shell: pwsh
+        run: |
+          $issPath = Join-Path $env:GITHUB_WORKSPACE "FilesInstaller.iss"
 
-          # Generate Inno Setup installer definition.
-          @"
+          @'
+          #define AppName "Files"
+          #define AppVersion "1.0.0"
+          #define SourceDir "Artifacts"
+
           [Setup]
           AppId={{D7A43C18-98A4-4F70-A912-765432109876}
-          AppName=Files Community Fork
-          AppVersion=$version
-          AppPublisher=Files Community Fork
+          AppName={#AppName}
+          AppVersion={#AppVersion}
+          AppPublisher=Files
           DefaultDirName={localappdata}\FilesInstaller
-          Uninstallable=no
-          DisableProgramGroupPage=yes
-          PrivilegesRequired=lowest
-          ArchitecturesAllowed=x64compatible
-          ArchitecturesInstallIn64BitMode=x64compatible
+          DefaultGroupName=Files
           OutputDir=Artifacts
           OutputBaseFilename=Files-Setup-x64
           Compression=lzma2
           SolidCompression=yes
           WizardStyle=modern
+          ArchitecturesInstallIn64BitMode=x64
+          PrivilegesRequired=lowest
+          Uninstallable=no
 
           [Files]
-          Source: "Artifacts\Package\*"; DestDir: "{tmp}\FilesPackage"; Flags: ignoreversion recursesubdirs createallsubdirs
+          Source: "{#SourceDir}\Package\*"; DestDir: "{app}\Package"; Flags: ignoreversion recursesubdirs createallsubdirs
+          Source: "{#SourceDir}\Install-Files.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
           [Run]
-          Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\FilesPackage\Install-Files.ps1"""; Flags: waituntilterminated runhidden; StatusMsg: "Installing Files..."
-          "@ | Set-Content (Join-Path $root "installer.iss") -Encoding UTF8
+          Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Install-Files.ps1"""; Flags: waituntilterminated; StatusMsg: "Installing Files..."
+          '@ | Set-Content -Path $issPath -Encoding UTF8
 
-          # Install Inno Setup if unavailable.
-          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) {
-            Write-Host "Installing Inno Setup..."
+          Write-Host "Inno Setup configuration created."
 
-            choco install innosetup --yes --no-progress
+      # 11. Compile final EXE
+      - name: Build EXE installer
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "Inno Setup installation failed"
-            }
+          if (-not (Test-Path $compiler)) {
+            $compiler = "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
           }
 
-          # Locate Inno Setup compiler.
-          Write-Host "Locating Inno Setup compiler..."
-
-          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-
-          if (-not $iscc) {
-            $isccPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          }
-          else {
-            $isccPath = $iscc.Source
+          if (-not (Test-Path $compiler)) {
+            throw "Inno Setup compiler was not found"
           }
 
-          if (-not (Test-Path -LiteralPath $isccPath)) {
-            throw "ISCC.exe was not found after installing Inno Setup"
-          }
-
-          # Compile EXE installer.
-          Write-Host "Compiling EXE installer..."
-
-          & $isccPath (Join-Path $root "installer.iss")
+          & $compiler FilesInstaller.iss
 
           if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup compilation failed"
           }
 
-          $exe = Join-Path $artifacts "Files-Setup-x64.exe"
+          $exe = Join-Path $env:GITHUB_WORKSPACE "Artifacts\Files-Setup-x64.exe"
 
-          if (-not (Test-Path -LiteralPath $exe)) {
-            throw "Installer EXE was not generated"
+          if (-not (Test-Path $exe)) {
+            throw "Installer EXE was not created"
           }
 
           Write-Host "Installer successfully created: $exe"
 
+      # 12. Upload installer
       - name: Upload EXE installer
         uses: actions/upload-artifact@v4
         with:
-          name: Files-Setup-x64
+          name: Files-Windows-x64-Installer
           path: Artifacts/Files-Setup-x64.exe
           if-no-files-found: error
           retention-days: 30
