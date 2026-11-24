@@ -1,12 +1,9 @@
 
-name: Build Files for Windows
+name: Build Files - Windows
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-  pull_request:
     branches:
       - main
 
@@ -26,28 +23,31 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Setup NuGet
-        uses: NuGet/setup-nuget@v2
-
-      - name: Setup .NET
+      - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: |
-            8.0.x
+          global-json-file: global.json
 
-      - name: Restore NuGet packages
-        run: nuget restore Files.sln
+      - name: Build and package Files
+        shell: pwsh
+        run: |
+          msbuild Files.slnx `
+            -restore `
+            -t:Build `
+            -p:Configuration=Release `
+            -p:Platform=x64 `
+            -p:GenerateAppxPackageOnBuild=true `
+            -p:AppxPackageDir="${{ github.workspace }}\Artifacts\\" `
+            -p:AppxBundle=Never `
+            -p:UapAppxPackageBuildMode=Sideload `
+            -v:quiet
 
-      - name: Build solution
-        run: msbuild Files.sln /m /p:Configuration=Release /p:Platform=x64
-
-      - name: Upload build artifacts
+      - name: Upload MSIX artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Files-Windows-x64
           path: |
-            **/bin/Release/**/*.msix
-            **/bin/Release/**/*.msixbundle
-            **/bin/Release/**/*.msixupload
+            Artifacts/**/*.msix
+            Artifacts/**/*.cer
           if-no-files-found: warn
           retention-days: 14
