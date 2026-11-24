@@ -40,6 +40,8 @@ jobs:
           Get-ChildItem -Path "src" -Directory -Recurse -Filter "obj" |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
+          Write-Host "Previous build files cleaned."
+
       - name: Build and package installer
         shell: pwsh
         env:
@@ -60,6 +62,8 @@ jobs:
           $cer = Join-Path $stage "Files-Signing.cer"
 
           if ($env:FILES_SIGNING_PFX_BASE64 -and $env:FILES_SIGNING_PFX_PASSWORD) {
+            Write-Host "Importing signing certificate..."
+
             [IO.File]::WriteAllBytes(
               $pfx,
               [Convert]::FromBase64String($env:FILES_SIGNING_PFX_BASE64)
@@ -77,7 +81,7 @@ jobs:
             $packagePassword = $env:FILES_SIGNING_PFX_PASSWORD
           }
           else {
-            Write-Host "Creating a temporary signing certificate"
+            Write-Host "Creating a temporary signing certificate..."
 
             $packagePassword = [Guid]::NewGuid().ToString("N") + "Aa1!"
 
@@ -107,11 +111,29 @@ jobs:
 
           Export-Certificate -Cert $cert -FilePath $cer | Out-Null
 
+          # Explicitly restore Files.App.Server.
+          # This fixes NETSDK1004 when its assets file is missing.
+          Write-Host "Restoring Files.App.Server..."
+
+          dotnet restore "src/Files.App.Server/Files.App.Server.csproj"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Files.App.Server NuGet restore failed"
+          }
+
+          # Restore the main application.
+          Write-Host "Restoring Files.App..."
+
+          dotnet restore "src/Files.App/Files.App.csproj"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Files.App NuGet restore failed"
+          }
+
           # Build the Files application.
           Write-Host "Building Files.App..."
 
           msbuild "src/Files.App/Files.App.csproj" `
-            /restore `
             /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
@@ -130,7 +152,12 @@ jobs:
           }
 
           # Locate the generated MSIX/AppX bundle.
-          $bundle = Get-ChildItem -Path (Join-Path $root "src/Files.App") -Recurse -File |
+          Write-Host "Searching for MSIX bundle..."
+
+          $bundle = Get-ChildItem `
+            -Path (Join-Path $root "src/Files.App") `
+            -Recurse `
+            -File |
             Where-Object {
               $_.Extension -in @(".msixbundle", ".appxbundle")
             } |
@@ -142,10 +169,16 @@ jobs:
           }
 
           Write-Host "Found package: $($bundle.FullName)"
-          Copy-Item $bundle.FullName $stage
+
+          Copy-Item $bundle.FullName $stage -Force
 
           # Copy framework dependencies, if generated.
-          $dependencies = Get-ChildItem -Path $bundle.Directory.FullName -Recurse -File |
+          Write-Host "Collecting package dependencies..."
+
+          $dependencies = Get-ChildItem `
+            -Path $bundle.Directory.FullName `
+            -Recurse `
+            -File |
             Where-Object {
               $_.FullName -match '[\\/]Dependencies[\\/]' -and
               $_.Extension -in @(".appx", ".msix")
@@ -157,7 +190,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path $depDir | Out-Null
 
             foreach ($dep in $dependencies) {
-              Copy-Item $dep.FullName $depDir
+              Copy-Item $dep.FullName $depDir -Force
             }
           }
 
@@ -215,8 +248,16 @@ jobs:
           '@ | Set-Content (Join-Path $stage "Install-Files.ps1") -Encoding UTF8
 
           # Read application version from manifest.
+          Write-Host "Reading application version..."
+
           [xml]$manifest = Get-Content "src/Files.App/Package.appxmanifest"
           $version = $manifest.Package.Identity.Version
+
+          if (-not $version) {
+            throw "Could not read application version from manifest"
+          }
+
+          Write-Host "Application version: $version"
 
           # Generate Inno Setup installer definition.
           @"
@@ -246,6 +287,8 @@ jobs:
 
           # Install Inno Setup if unavailable.
           if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Inno Setup..."
+
             choco install innosetup --yes --no-progress
 
             if ($LASTEXITCODE -ne 0) {
@@ -254,7 +297,7 @@ jobs:
           }
 
           # Locate Inno Setup compiler.
-          Write-Host "Compiling EXE installer..."
+          Write-Host "Locating Inno Setup compiler..."
 
           $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
 
@@ -270,6 +313,8 @@ jobs:
           }
 
           # Compile EXE installer.
+          Write-Host "Compiling EXE installer..."
+
           & $isccPath (Join-Path $root "installer.iss")
 
           if ($LASTEXITCODE -ne 0) {
@@ -282,7 +327,7 @@ jobs:
             throw "Installer EXE was not generated"
           }
 
-          Write-Host "Installer created: $exe"
+          Write-Host "Installer successfully created: $exe"
 
       - name: Upload EXE installer
         uses: actions/upload-artifact@v4
